@@ -1,346 +1,1048 @@
-# VectorDB — Build a Vector Database from Scratch in C++
+# DPI Engine - Deep Packet Inspection System
 
-A fully working **Vector Database** built from scratch in C++ with a web UI.  
-Implements **HNSW**, **KD-Tree**, and **Brute Force** search algorithms side-by-side, plus a **RAG pipeline** powered by a local LLM via Ollama.
 
-> Built as an educational project to show how production vector databases like Pinecone, Weaviate, and Chroma actually work under the hood.
+This document explains **everything** about this project - from basic networking concepts to the complete code architecture. After reading this, you should understand exactly how packets flow through the system without needing to read the code.
 
 ---
 
-## What This Project Does
+## Table of Contents
 
-| Feature | Description |
-|---|---|
-| **3 Search Algorithms** | HNSW (production-grade), KD-Tree, Brute Force — run all three and compare speed |
-| **3 Distance Metrics** | Cosine similarity, Euclidean distance, Manhattan distance |
-| **16D Demo Vectors** | 20 pre-loaded semantic vectors across 4 categories (CS, Math, Food, Sports) |
-| **2D PCA Scatter Plot** | Live visualization of semantic space — watch clusters form |
-| **Real Document Embedding** | Paste any text → Ollama embeds it with `nomic-embed-text` (768D) |
-| **RAG Pipeline** | Ask questions about your documents → HNSW retrieves context → local LLM answers |
-| **Full REST API** | CRUD endpoints: insert, delete, search, benchmark, hnsw-info |
-
----
-
-## How It Works
-
-```
-Your Text
-    │
-    ▼
-Ollama (nomic-embed-text)          ← converts text to a 768-dimensional vector
-    │
-    ▼
-HNSW Index (C++)                   ← indexes the vector in a multilayer graph
-    │
-    ▼
-Semantic Search                    ← finds nearest neighbors in vector space
-    │
-    ▼
-Ollama (llama3.2)                  ← reads retrieved chunks, generates an answer
-    │
-    ▼
-Answer
-```
-
-**HNSW (Hierarchical Navigable Small World)** is the same algorithm used by Pinecone, Weaviate, Chroma, and Milvus. It builds a multilayer graph where each layer is progressively sparser — searches start at the top layer and zoom in, achieving O(log N) complexity instead of O(N) for brute force.
+1. [What is DPI?](#1-what-is-dpi)
+2. [Networking Background](#2-networking-background)
+3. [Project Overview](#3-project-overview)
+4. [File Structure](#4-file-structure)
+5. [The Journey of a Packet (Simple Version)](#5-the-journey-of-a-packet-simple-version)
+6. [The Journey of a Packet (Multi-threaded Version)](#6-the-journey-of-a-packet-multi-threaded-version)
+7. [Deep Dive: Each Component](#7-deep-dive-each-component)
+8. [How SNI Extraction Works](#8-how-sni-extraction-works)
+9. [How Blocking Works](#9-how-blocking-works)
+10. [Building and Running](#10-building-and-running)
+11. [Understanding the Output](#11-understanding-the-output)
 
 ---
 
-## Prerequisites
+## 1. What is DPI?
 
-You need **3 things** installed on your Windows laptop:
+**Deep Packet Inspection (DPI)** is a technology used to examine the contents of network packets as they pass through a checkpoint. Unlike simple firewalls that only look at packet headers (source/destination IP), DPI looks *inside* the packet payload.
 
-1. **MSYS2** (gives you g++ compiler)
-2. **Git**
-3. **Ollama** (runs the local AI models)
+### Real-World Uses:
+- **ISPs**: Throttle or block certain applications (e.g., BitTorrent)
+- **Enterprises**: Block social media on office networks
+- **Parental Controls**: Block inappropriate websites
+- **Security**: Detect malware or intrusion attempts
 
----
-
-## Step-by-Step Setup (Windows)
-
-### Step 1 — Install MSYS2 (C++ Compiler)
-
-1. Go to **https://www.msys2.org** and download the installer
-2. Run the installer, keep default path (`C:\msys64`)
-3. After install, open **MSYS2 UCRT64** from Start Menu (the orange icon)
-4. Run these commands inside the MSYS2 terminal:
-
-```bash
-pacman -Syu
+### What Our DPI Engine Does:
 ```
-*(Close and reopen the terminal if it asks you to)*
-
-```bash
-pacman -S mingw-w64-ucrt-x86_64-gcc
-```
-
-5. Add g++ to your Windows PATH:
-   - Press `Win + R`, type `sysdm.cpl`, press Enter
-   - Click **Advanced** → **Environment Variables**
-   - Under **System variables**, find **Path**, click **Edit**
-   - Click **New** and add: `C:\msys64\ucrt64\bin`
-   - Click OK on all windows
-   - **Open a new PowerShell** and verify:
-   ```
-   g++ --version
-   ```
-   You should see something like `g++ (GCC) 15.x.x`
-
----
-
-### Step 2 — Install Git
-
-1. Go to **https://git-scm.com/download/win** and download Git for Windows
-2. Run the installer with default settings
-3. Verify in PowerShell:
-```
-git --version
+User Traffic (PCAP) → [DPI Engine] → Filtered Traffic (PCAP)
+                           ↓
+                    - Identifies apps (YouTube, Facebook, etc.)
+                    - Blocks based on rules
+                    - Generates reports
 ```
 
 ---
 
-### Step 3 — Install Ollama (Local AI Models)
+## 2. Networking Background
 
-1. Go to **https://ollama.com** and click **Download for Windows**
-2. Run the installer
-3. Ollama starts automatically in the system tray
-4. Open **PowerShell** and pull the two required models:
+### The Network Stack (Layers)
 
-```powershell
-ollama pull nomic-embed-text
+When you visit a website, data travels through multiple "layers":
+
 ```
-*(~274 MB — this is the embedding model)*
-
-```powershell
-ollama pull llama3.2
+┌─────────────────────────────────────────────────────────┐
+│ Layer 7: Application    │ HTTP, TLS, DNS               │
+├─────────────────────────────────────────────────────────┤
+│ Layer 4: Transport      │ TCP (reliable), UDP (fast)   │
+├─────────────────────────────────────────────────────────┤
+│ Layer 3: Network        │ IP addresses (routing)       │
+├─────────────────────────────────────────────────────────┤
+│ Layer 2: Data Link      │ MAC addresses (local network)│
+└─────────────────────────────────────────────────────────┘
 ```
-*(~2 GB — this is the language model)*
 
-5. Verify Ollama is running:
-```powershell
-ollama list
+### A Packet's Structure
+
+Every network packet is like a **Russian nesting doll** - headers wrapped inside headers:
+
 ```
-You should see both models listed.
+┌──────────────────────────────────────────────────────────────────┐
+│ Ethernet Header (14 bytes)                                       │
+│ ┌──────────────────────────────────────────────────────────────┐ │
+│ │ IP Header (20 bytes)                                         │ │
+│ │ ┌──────────────────────────────────────────────────────────┐ │ │
+│ │ │ TCP Header (20 bytes)                                    │ │ │
+│ │ │ ┌──────────────────────────────────────────────────────┐ │ │ │
+│ │ │ │ Payload (Application Data)                           │ │ │ │
+│ │ │ │ e.g., TLS Client Hello with SNI                      │ │ │ │
+│ │ │ └──────────────────────────────────────────────────────┘ │ │ │
+│ │ └──────────────────────────────────────────────────────────┘ │ │
+│ └──────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-> **Minimum specs for Ollama:** 8GB RAM recommended. The models will use ~3GB total.
+### The Five-Tuple
+
+A **connection** (or "flow") is uniquely identified by 5 values:
+
+| Field | Example | Purpose |
+|-------|---------|---------|
+| Source IP | 192.168.1.100 | Who is sending |
+| Destination IP | 172.217.14.206 | Where it's going |
+| Source Port | 54321 | Sender's application identifier |
+| Destination Port | 443 | Service being accessed (443 = HTTPS) |
+| Protocol | TCP (6) | TCP or UDP |
+
+**Why is this important?** 
+- All packets with the same 5-tuple belong to the same connection
+- If we block one packet of a connection, we should block all of them
+- This is how we "track" conversations between computers
+
+### What is SNI?
+
+**Server Name Indication (SNI)** is part of the TLS/HTTPS handshake. When you visit `https://www.youtube.com`:
+
+1. Your browser sends a "Client Hello" message
+2. This message includes the domain name in **plaintext** (not encrypted yet!)
+3. The server uses this to know which certificate to send
+
+```
+TLS Client Hello:
+├── Version: TLS 1.2
+├── Random: [32 bytes]
+├── Cipher Suites: [list]
+└── Extensions:
+    └── SNI Extension:
+        └── Server Name: "www.youtube.com"  ← We extract THIS!
+```
+
+**This is the key to DPI**: Even though HTTPS is encrypted, the domain name is visible in the first packet!
 
 ---
 
-### Step 4 — Clone the Repository
+## 3. Project Overview
 
-Open **PowerShell** and run:
+### What This Project Does
 
-```powershell
-git clone https://github.com/YOUR_USERNAME/VectorDB.git
-cd VectorDB
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Wireshark   │     │ DPI Engine  │     │ Output      │
+│ Capture     │ ──► │             │ ──► │ PCAP        │
+│ (input.pcap)│     │ - Parse     │     │ (filtered)  │
+└─────────────┘     │ - Classify  │     └─────────────┘
+                    │ - Block     │
+                    │ - Report    │
+                    └─────────────┘
 ```
 
-*(Replace `YOUR_USERNAME` with the actual GitHub username)*
+### Two Versions
+
+| Version | File | Use Case |
+|---------|------|----------|
+| Simple (Single-threaded) | `src/main_working.cpp` | Learning, small captures |
+| Multi-threaded | `src/dpi_mt.cpp` | Production, large captures |
 
 ---
 
-### Step 5 — Compile the C++ Server
+## 4. File Structure
 
-Inside the `VectorDB` folder, run:
-
-```powershell
-g++ -std=c++17 -O2 main.cpp -o db -lws2_32
 ```
-
-This produces `db.exe`. It takes about 10–20 seconds.
-
-> **Troubleshooting:**
-> - `g++: command not found` → MSYS2 not in PATH, redo Step 1 point 5
-> - `undefined reference to WSA...` → missing `-lws2_32` flag, add it
-> - Takes too long? Remove `-O2` for faster (but slower executable) compile
-
----
-
-### Step 6 — Run Everything
-
-**Terminal 1** — Start Ollama (if not already running):
-```powershell
-ollama serve
-```
-*(If Ollama is already in the system tray, skip this)*
-
-**Terminal 2** — Start the VectorDB server:
-```powershell
-./db
-```
-
-You should see:
-```
-=== VectorDB Engine ===
-http://localhost:8080
-20 demo vectors | 16 dims | HNSW+KD-Tree+BruteForce
-Ollama: ONLINE
-  embed model: nomic-embed-text  gen model: llama3.2
-```
-
-**Open your browser** and go to:
-```
-http://localhost:8080
-```
-
----
-
-## Using the Application
-
-### Tab 1: Search (Demo Vectors)
-
-- Type any concept in the search box: `binary tree`, `sushi`, `basketball`, `calculus`
-- Choose your algorithm: **HNSW**, **KD-Tree**, or **Brute Force**
-- Choose distance metric: **Cosine**, **Euclidean**, or **Manhattan**
-- Click **⚡ SEARCH** — results appear with distances, the matching point glows on the scatter plot
-- Click **▶ COMPARE ALL ALGOS** to run all 3 algorithms and compare their speed
-
-**The scatter plot** shows all 20 vectors projected to 2D using PCA. Notice how the 4 semantic categories (CS, Math, Food, Sports) form distinct clusters — this is what "semantic similarity" looks like visually.
-
-### Tab 2: Documents (Real Embeddings)
-
-This uses Ollama to generate **real 768-dimensional embeddings** from any text.
-
-1. Type a title (e.g., `Operating Systems Notes`)
-2. Paste any text — lecture notes, textbook paragraphs, Wikipedia articles
-3. Click **⚡ EMBED & INSERT**
-4. Long documents are automatically split into overlapping 250-word chunks
-5. Each chunk gets its own embedding and is stored in a separate HNSW index
-
-### Tab 3: Ask AI (RAG Pipeline)
-
-1. Make sure you have inserted some documents in Tab 2 first
-2. Type a question about your documents
-3. Click **🤖 ASK AI**
-
-What happens behind the scenes:
-```
-1. Your question → embedded with nomic-embed-text (768D vector)
-2. HNSW search → finds 3 most semantically similar chunks
-3. Retrieved chunks → sent as context to llama3.2
-4. llama3.2 → generates an answer based only on your documents
-```
-
-The answer streams in with a typewriter effect. Click the **context chips** to see exactly which chunks the AI used.
-
----
-
-## REST API Reference
-
-The server exposes a full REST API at `http://localhost:8080`.
-
-### Demo Vector Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/search?v=f1,f2,...&k=5&metric=cosine&algo=hnsw` | K-NN search |
-| `POST` | `/insert` | Insert a demo vector |
-| `DELETE` | `/delete/:id` | Delete by ID |
-| `GET` | `/items` | List all demo vectors |
-| `GET` | `/benchmark?v=...&k=5&metric=cosine` | Compare all 3 algorithms |
-| `GET` | `/hnsw-info` | HNSW graph structure and layer stats |
-| `GET` | `/stats` | Database statistics |
-
-### Document & RAG Endpoints
-
-| Method | Endpoint | Body | Description |
-|---|---|---|---|
-| `POST` | `/doc/insert` | `{"title":"...","text":"..."}` | Embed and store document |
-| `GET` | `/doc/list` | — | List all stored documents |
-| `DELETE` | `/doc/delete/:id` | — | Delete document chunk |
-| `POST` | `/doc/ask` | `{"question":"...","k":3}` | RAG: retrieve + generate |
-| `GET` | `/status` | — | Ollama status and model info |
-
-### Example: Search via curl
-
-```powershell
-curl "http://localhost:8080/search?v=0.9,0.8,0.7,0.6,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1&k=3&metric=cosine&algo=hnsw"
-```
-
-### Example: Ask a question via curl
-
-```powershell
-curl -X POST http://localhost:8080/doc/ask `
-  -H "Content-Type: application/json" `
-  -d '{"question":"What is dynamic programming?","k":3}'
+packet_analyzer/
+├── include/                    # Header files (declarations)
+│   ├── pcap_reader.h          # PCAP file reading
+│   ├── packet_parser.h        # Network protocol parsing
+│   ├── sni_extractor.h        # TLS/HTTP inspection
+│   ├── types.h                # Data structures (FiveTuple, AppType, etc.)
+│   ├── rule_manager.h         # Blocking rules (multi-threaded version)
+│   ├── connection_tracker.h   # Flow tracking (multi-threaded version)
+│   ├── load_balancer.h        # LB thread (multi-threaded version)
+│   ├── fast_path.h            # FP thread (multi-threaded version)
+│   ├── thread_safe_queue.h    # Thread-safe queue
+│   └── dpi_engine.h           # Main orchestrator
+│
+├── src/                        # Implementation files
+│   ├── pcap_reader.cpp        # PCAP file handling
+│   ├── packet_parser.cpp      # Protocol parsing
+│   ├── sni_extractor.cpp      # SNI/Host extraction
+│   ├── types.cpp              # Helper functions
+│   ├── main_working.cpp       # ★ SIMPLE VERSION ★
+│   ├── dpi_mt.cpp             # ★ MULTI-THREADED VERSION ★
+│   └── [other files]          # Supporting code
+│
+├── generate_test_pcap.py      # Creates test data
+├── test_dpi.pcap              # Sample capture with various traffic
+└── README.md                  # This file!
 ```
 
 ---
 
-## Project Structure
+## 5. The Journey of a Packet (Simple Version)
 
-```
-VectorDB/
-├── main.cpp        ← C++ backend (HNSW, KD-Tree, BruteForce, REST API, RAG)
-├── httplib.h       ← Single-header HTTP server library (cpp-httplib)
-├── index.html      ← Frontend (PCA scatter plot, chat UI, benchmark)
-└── README.md       ← This file
-```
+Let's trace a single packet through `main_working.cpp`:
 
-### Architecture (main.cpp)
+### Step 1: Read PCAP File
 
-```
-BruteForce          O(N·d)      Exact, baseline
-KDTree              O(log N)    Exact, axis-aligned partitioning
-HNSW                O(log N)    Approximate, multilayer small-world graph
-
-VectorDB            Unified interface over all 3 (16D demo vectors)
-DocumentDB          HNSW-only index for real Ollama embeddings (768D)
-OllamaClient        HTTP client → /api/embeddings + /api/generate
-```
-
----
-
-## Algorithm Deep Dive
-
-### HNSW (Hierarchical Navigable Small World)
-
-Nodes are inserted into a multilayer graph. Each node randomly gets assigned a maximum layer. Layer 0 has all nodes with many connections; higher layers have fewer nodes (exponentially fewer) with longer-range connections.
-
-**Insert:** Start at the top layer, greedily find the nearest node, drop a layer, repeat. At each layer from your assigned max down to 0, run a beam search (ef_construction=200) and connect to the M nearest neighbors bidirectionally.
-
-**Search:** Same greedy descent from top layer. At layer 0, expand to ef nearest candidates using a priority queue.
-
-**Why it's fast:** The upper layers act like a highway — you quickly get to the right neighborhood, then zoom in at layer 0.
-
-### KD-Tree (K-Dimensional Tree)
-
-Binary space partitioning. Each node splits space along one dimension (cycling through all dimensions). Search prunes entire subtrees when the closest possible point in that subtree can't beat the current best — the "ball within hyperslab" check.
-
-**Weakness:** Degrades with high dimensions (curse of dimensionality). Works well for ≤20D, becomes close to brute force at 768D.
-
-### Why HNSW Wins at High Dimensions
-
-KD-Tree pruning relies on axis-aligned distance bounds. In high dimensions, almost all the space is near the boundary of the hypersphere — no subtrees get pruned. HNSW's graph-based approach doesn't have this problem.
-
----
-
-## Common Issues
-
-| Problem | Fix |
-|---|---|
-| `Ollama: OFFLINE` in header | Run `ollama serve` in a terminal |
-| Embedding takes forever | Ollama is downloading the model on first use, wait 2 min |
-| `g++: command not found` | Add `C:\msys64\ucrt64\bin` to Windows PATH |
-| Port 8080 already in use | Kill the process: `netstat -ano \| findstr 8080` then `taskkill /PID <pid> /F` |
-| LLM answer is slow | Normal — llama3.2 takes 10–30s on a laptop CPU. Use llama3.2:1b for faster answers |
-
-### Use a Smaller/Faster LLM
-
-If llama3.2 is too slow on your laptop, switch to the 1B model:
-
-```powershell
-ollama pull llama3.2:1b
-```
-
-Then edit [main.cpp](main.cpp) line where `genModel` is set:
 ```cpp
-std::string genModel = "llama3.2:1b";   // change this
+PcapReader reader;
+reader.open("capture.pcap");
 ```
-Recompile and restart.
+
+**What happens:**
+1. Open the file in binary mode
+2. Read the 24-byte global header (magic number, version, etc.)
+3. Verify it's a valid PCAP file
+
+**PCAP File Format:**
+```
+┌────────────────────────────┐
+│ Global Header (24 bytes)   │  ← Read once at start
+├────────────────────────────┤
+│ Packet Header (16 bytes)   │  ← Timestamp, length
+│ Packet Data (variable)     │  ← Actual network bytes
+├────────────────────────────┤
+│ Packet Header (16 bytes)   │
+│ Packet Data (variable)     │
+├────────────────────────────┤
+│ ... more packets ...       │
+└────────────────────────────┘
+```
+
+### Step 2: Read Each Packet
+
+```cpp
+while (reader.readNextPacket(raw)) {
+    // raw.data contains the packet bytes
+    // raw.header contains timestamp and length
+}
+```
+
+**What happens:**
+1. Read 16-byte packet header
+2. Read N bytes of packet data (N = header.incl_len)
+3. Return false when no more packets
+
+### Step 3: Parse Protocol Headers
+
+```cpp
+PacketParser::parse(raw, parsed);
+```
+
+**What happens (in packet_parser.cpp):**
+
+```
+raw.data bytes:
+[0-13]   Ethernet Header
+[14-33]  IP Header  
+[34-53]  TCP Header
+[54+]    Payload
+
+After parsing:
+parsed.src_mac  = "00:11:22:33:44:55"
+parsed.dest_mac = "aa:bb:cc:dd:ee:ff"
+parsed.src_ip   = "192.168.1.100"
+parsed.dest_ip  = "172.217.14.206"
+parsed.src_port = 54321
+parsed.dest_port = 443
+parsed.protocol = 6 (TCP)
+parsed.has_tcp  = true
+```
+
+**Parsing the Ethernet Header (14 bytes):**
+```
+Bytes 0-5:   Destination MAC
+Bytes 6-11:  Source MAC
+Bytes 12-13: EtherType (0x0800 = IPv4)
+```
+
+**Parsing the IP Header (20+ bytes):**
+```
+Byte 0:      Version (4 bits) + Header Length (4 bits)
+Byte 8:      TTL (Time To Live)
+Byte 9:      Protocol (6=TCP, 17=UDP)
+Bytes 12-15: Source IP
+Bytes 16-19: Destination IP
+```
+
+**Parsing the TCP Header (20+ bytes):**
+```
+Bytes 0-1:   Source Port
+Bytes 2-3:   Destination Port
+Bytes 4-7:   Sequence Number
+Bytes 8-11:  Acknowledgment Number
+Byte 12:     Data Offset (header length)
+Byte 13:     Flags (SYN, ACK, FIN, etc.)
+```
+
+### Step 4: Create Five-Tuple and Look Up Flow
+
+```cpp
+FiveTuple tuple;
+tuple.src_ip = parseIP(parsed.src_ip);
+tuple.dst_ip = parseIP(parsed.dest_ip);
+tuple.src_port = parsed.src_port;
+tuple.dst_port = parsed.dest_port;
+tuple.protocol = parsed.protocol;
+
+Flow& flow = flows[tuple];  // Get or create
+```
+
+**What happens:**
+- The flow table is a hash map: `FiveTuple → Flow`
+- If this 5-tuple exists, we get the existing flow
+- If not, a new flow is created
+- All packets with the same 5-tuple share the same flow
+
+### Step 5: Extract SNI (Deep Packet Inspection)
+
+```cpp
+// For HTTPS traffic (port 443)
+if (pkt.tuple.dst_port == 443 && pkt.payload_length > 5) {
+    auto sni = SNIExtractor::extract(payload, payload_length);
+    if (sni) {
+        flow.sni = *sni;                    // "www.youtube.com"
+        flow.app_type = sniToAppType(*sni); // AppType::YOUTUBE
+    }
+}
+```
+
+**What happens (in sni_extractor.cpp):**
+
+1. **Check if it's a TLS Client Hello:**
+   ```
+   Byte 0: Content Type = 0x16 (Handshake) ✓
+   Byte 5: Handshake Type = 0x01 (Client Hello) ✓
+   ```
+
+2. **Navigate to Extensions:**
+   ```
+   Skip: Version, Random, Session ID, Cipher Suites, Compression
+   ```
+
+3. **Find SNI Extension (type 0x0000):**
+   ```
+   Extension Type: 0x0000 (SNI)
+   Extension Length: N
+   SNI List Length: M
+   SNI Type: 0x00 (hostname)
+   SNI Length: L
+   SNI Value: "www.youtube.com"  ← FOUND!
+   ```
+
+4. **Map SNI to App Type:**
+   ```cpp
+   // In types.cpp
+   if (sni.find("youtube") != std::string::npos) {
+       return AppType::YOUTUBE;
+   }
+   ```
+
+### Step 6: Check Blocking Rules
+
+```cpp
+if (rules.isBlocked(tuple.src_ip, flow.app_type, flow.sni)) {
+    flow.blocked = true;
+}
+```
+
+**What happens:**
+```cpp
+// Check IP blacklist
+if (blocked_ips.count(src_ip)) return true;
+
+// Check app blacklist
+if (blocked_apps.count(app)) return true;
+
+// Check domain blacklist (substring match)
+for (const auto& dom : blocked_domains) {
+    if (sni.find(dom) != std::string::npos) return true;
+}
+
+return false;
+```
+
+### Step 7: Forward or Drop
+
+```cpp
+if (flow.blocked) {
+    dropped++;
+    // Don't write to output
+} else {
+    forwarded++;
+    // Write packet to output file
+    output.write(packet_header);
+    output.write(packet_data);
+}
+```
+
+### Step 8: Generate Report
+
+After processing all packets:
+```cpp
+// Count apps
+for (const auto& [tuple, flow] : flows) {
+    app_stats[flow.app_type]++;
+}
+
+// Print report
+"YouTube: 150 packets (15%)"
+"Facebook: 80 packets (8%)"
+...
+```
 
 ---
 
-## License
+## 6. The Journey of a Packet (Multi-threaded Version)
 
-MIT — use this however you want.
+The multi-threaded version (`dpi_mt.cpp`) adds **parallelism** for high performance:
+
+### Architecture Overview
+
+```
+                    ┌─────────────────┐
+                    │  Reader Thread  │
+                    │  (reads PCAP)   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │      hash(5-tuple) % 2      │
+              ▼                             ▼
+    ┌─────────────────┐           ┌─────────────────┐
+    │  LB0 Thread     │           │  LB1 Thread     │
+    │  (Load Balancer)│           │  (Load Balancer)│
+    └────────┬────────┘           └────────┬────────┘
+             │                             │
+      ┌──────┴──────┐               ┌──────┴──────┐
+      │hash % 2     │               │hash % 2     │
+      ▼             ▼               ▼             ▼
+┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐
+│FP0 Thread│ │FP1 Thread│   │FP2 Thread│ │FP3 Thread│
+│(Fast Path)│ │(Fast Path)│   │(Fast Path)│ │(Fast Path)│
+└─────┬────┘ └─────┬────┘   └─────┬────┘ └─────┬────┘
+      │            │              │            │
+      └────────────┴──────────────┴────────────┘
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │   Output Queue        │
+              └───────────┬───────────┘
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │  Output Writer Thread │
+              │  (writes to PCAP)     │
+              └───────────────────────┘
+```
+
+### Why This Design?
+
+1. **Load Balancers (LBs):** Distribute work across FPs
+2. **Fast Paths (FPs):** Do the actual DPI processing
+3. **Consistent Hashing:** Same 5-tuple always goes to same FP
+
+**Why consistent hashing matters:**
+```
+Connection: 192.168.1.100:54321 → 142.250.185.206:443
+
+Packet 1 (SYN):         hash → FP2
+Packet 2 (SYN-ACK):     hash → FP2  (same FP!)
+Packet 3 (Client Hello): hash → FP2  (same FP!)
+Packet 4 (Data):        hash → FP2  (same FP!)
+
+All packets of this connection go to FP2.
+FP2 can track the flow state correctly.
+```
+
+### Detailed Flow
+
+#### Step 1: Reader Thread
+
+```cpp
+// Main thread reads PCAP
+while (reader.readNextPacket(raw)) {
+    Packet pkt = createPacket(raw);
+    
+    // Hash to select Load Balancer
+    size_t lb_idx = hash(pkt.tuple) % num_lbs;
+    
+    // Push to LB's queue
+    lbs_[lb_idx]->queue().push(pkt);
+}
+```
+
+#### Step 2: Load Balancer Thread
+
+```cpp
+void LoadBalancer::run() {
+    while (running_) {
+        // Pop from my input queue
+        auto pkt = input_queue_.pop();
+        
+        // Hash to select Fast Path
+        size_t fp_idx = hash(pkt.tuple) % num_fps_;
+        
+        // Push to FP's queue
+        fps_[fp_idx]->queue().push(pkt);
+    }
+}
+```
+
+#### Step 3: Fast Path Thread
+
+```cpp
+void FastPath::run() {
+    while (running_) {
+        // Pop from my input queue
+        auto pkt = input_queue_.pop();
+        
+        // Look up flow (each FP has its own flow table)
+        Flow& flow = flows_[pkt.tuple];
+        
+        // Classify (SNI extraction)
+        classifyFlow(pkt, flow);
+        
+        // Check rules
+        if (rules_->isBlocked(pkt.tuple.src_ip, flow.app_type, flow.sni)) {
+            stats_->dropped++;
+        } else {
+            // Forward: push to output queue
+            output_queue_->push(pkt);
+        }
+    }
+}
+```
+
+#### Step 4: Output Writer Thread
+
+```cpp
+void outputThread() {
+    while (running_ || output_queue_.size() > 0) {
+        auto pkt = output_queue_.pop();
+        
+        // Write to output file
+        output_file.write(packet_header);
+        output_file.write(pkt.data);
+    }
+}
+```
+
+### Thread-Safe Queue
+
+The magic that makes multi-threading work:
+
+```cpp
+template<typename T>
+class TSQueue {
+    std::queue<T> queue_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    
+    void push(T item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(item);
+        not_empty_.notify_one();  // Wake up waiting consumer
+    }
+    
+    T pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_empty_.wait(lock, [&]{ return !queue_.empty(); });
+        T item = queue_.front();
+        queue_.pop();
+        return item;
+    }
+};
+```
+
+**How it works:**
+- `push()`: Producer adds item, signals waiting consumers
+- `pop()`: Consumer waits until item available, then takes it
+- `mutex`: Only one thread can access at a time
+- `condition_variable`: Efficient waiting (no busy-loop)
+
+---
+
+## 7. Deep Dive: Each Component
+
+### pcap_reader.h / pcap_reader.cpp
+
+**Purpose:** Read network captures saved by Wireshark
+
+**Key structures:**
+```cpp
+struct PcapGlobalHeader {
+    uint32_t magic_number;   // 0xa1b2c3d4 identifies PCAP
+    uint16_t version_major;  // Usually 2
+    uint16_t version_minor;  // Usually 4
+    uint32_t snaplen;        // Max packet size captured
+    uint32_t network;        // 1 = Ethernet
+};
+
+struct PcapPacketHeader {
+    uint32_t ts_sec;         // Timestamp (seconds)
+    uint32_t ts_usec;        // Timestamp (microseconds)
+    uint32_t incl_len;       // Bytes saved in file
+    uint32_t orig_len;       // Original packet size
+};
+```
+
+**Key functions:**
+- `open(filename)`: Open PCAP, validate header
+- `readNextPacket(raw)`: Read next packet into buffer
+- `close()`: Clean up
+
+### packet_parser.h / packet_parser.cpp
+
+**Purpose:** Extract protocol fields from raw bytes
+
+**Key function:**
+```cpp
+bool PacketParser::parse(const RawPacket& raw, ParsedPacket& parsed) {
+    parseEthernet(...);  // Extract MACs, EtherType
+    parseIPv4(...);      // Extract IPs, protocol, TTL
+    parseTCP(...);       // Extract ports, flags, seq numbers
+    // OR
+    parseUDP(...);       // Extract ports
+}
+```
+
+**Important concepts:**
+
+*Network Byte Order:* Network protocols use big-endian (most significant byte first). Your computer might use little-endian. We use `ntohs()` and `ntohl()` to convert:
+```cpp
+// ntohs = Network TO Host Short (16-bit)
+uint16_t port = ntohs(*(uint16_t*)(data + offset));
+
+// ntohl = Network TO Host Long (32-bit)
+uint32_t seq = ntohl(*(uint32_t*)(data + offset));
+```
+
+### sni_extractor.h / sni_extractor.cpp
+
+**Purpose:** Extract domain names from TLS and HTTP
+
+**For TLS (HTTPS):**
+```cpp
+std::optional<std::string> SNIExtractor::extract(
+    const uint8_t* payload, 
+    size_t length
+) {
+    // 1. Verify TLS record header
+    // 2. Verify Client Hello handshake
+    // 3. Skip to extensions
+    // 4. Find SNI extension (type 0x0000)
+    // 5. Extract hostname string
+}
+```
+
+**For HTTP:**
+```cpp
+std::optional<std::string> HTTPHostExtractor::extract(
+    const uint8_t* payload,
+    size_t length
+) {
+    // 1. Verify HTTP request (GET, POST, etc.)
+    // 2. Search for "Host: " header
+    // 3. Extract value until newline
+}
+```
+
+### types.h / types.cpp
+
+**Purpose:** Define data structures used throughout
+
+**FiveTuple:**
+```cpp
+struct FiveTuple {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t  protocol;
+    
+    bool operator==(const FiveTuple& other) const;
+};
+```
+
+**AppType:**
+```cpp
+enum class AppType {
+    UNKNOWN,
+    HTTP,
+    HTTPS,
+    DNS,
+    GOOGLE,
+    YOUTUBE,
+    FACEBOOK,
+    // ... more apps
+};
+```
+
+**sniToAppType function:**
+```cpp
+AppType sniToAppType(const std::string& sni) {
+    if (sni.find("youtube") != std::string::npos) 
+        return AppType::YOUTUBE;
+    if (sni.find("facebook") != std::string::npos) 
+        return AppType::FACEBOOK;
+    // ... more patterns
+}
+```
+
+---
+
+## 8. How SNI Extraction Works
+
+### The TLS Handshake
+
+When you visit `https://www.youtube.com`:
+
+```
+┌──────────┐                              ┌──────────┐
+│  Browser │                              │  Server  │
+└────┬─────┘                              └────┬─────┘
+     │                                         │
+     │ ──── Client Hello ─────────────────────►│
+     │      (includes SNI: www.youtube.com)    │
+     │                                         │
+     │ ◄─── Server Hello ───────────────────── │
+     │      (includes certificate)             │
+     │                                         │
+     │ ──── Key Exchange ─────────────────────►│
+     │                                         │
+     │ ◄═══ Encrypted Data ══════════════════► │
+     │      (from here on, everything is       │
+     │       encrypted - we can't see it)      │
+```
+
+**We can only extract SNI from the Client Hello!**
+
+### TLS Client Hello Structure
+
+```
+Byte 0:     Content Type = 0x16 (Handshake)
+Bytes 1-2:  Version = 0x0301 (TLS 1.0)
+Bytes 3-4:  Record Length
+
+-- Handshake Layer --
+Byte 5:     Handshake Type = 0x01 (Client Hello)
+Bytes 6-8:  Handshake Length
+
+-- Client Hello Body --
+Bytes 9-10:  Client Version
+Bytes 11-42: Random (32 bytes)
+Byte 43:     Session ID Length (N)
+Bytes 44 to 44+N: Session ID
+... Cipher Suites ...
+... Compression Methods ...
+
+-- Extensions --
+Bytes X-X+1: Extensions Length
+For each extension:
+    Bytes: Extension Type (2)
+    Bytes: Extension Length (2)
+    Bytes: Extension Data
+
+-- SNI Extension (Type 0x0000) --
+Extension Type: 0x0000
+Extension Length: L
+  SNI List Length: M
+  SNI Type: 0x00 (hostname)
+  SNI Length: K
+  SNI Value: "www.youtube.com" ← THE GOAL!
+```
+
+### Our Extraction Code (Simplified)
+
+```cpp
+std::optional<std::string> SNIExtractor::extract(
+    const uint8_t* payload, size_t length
+) {
+    // Check TLS record header
+    if (payload[0] != 0x16) return std::nullopt;  // Not handshake
+    if (payload[5] != 0x01) return std::nullopt;  // Not Client Hello
+    
+    size_t offset = 43;  // Skip to session ID
+    
+    // Skip Session ID
+    uint8_t session_len = payload[offset];
+    offset += 1 + session_len;
+    
+    // Skip Cipher Suites
+    uint16_t cipher_len = readUint16BE(payload + offset);
+    offset += 2 + cipher_len;
+    
+    // Skip Compression Methods
+    uint8_t comp_len = payload[offset];
+    offset += 1 + comp_len;
+    
+    // Read Extensions Length
+    uint16_t ext_len = readUint16BE(payload + offset);
+    offset += 2;
+    
+    // Search for SNI extension
+    size_t ext_end = offset + ext_len;
+    while (offset + 4 <= ext_end) {
+        uint16_t ext_type = readUint16BE(payload + offset);
+        uint16_t ext_data_len = readUint16BE(payload + offset + 2);
+        offset += 4;
+        
+        if (ext_type == 0x0000) {  // SNI!
+            // Parse SNI structure
+            uint16_t sni_len = readUint16BE(payload + offset + 3);
+            return std::string(
+                (char*)(payload + offset + 5), 
+                sni_len
+            );
+        }
+        
+        offset += ext_data_len;
+    }
+    
+    return std::nullopt;  // SNI not found
+}
+```
+
+---
+
+## 9. How Blocking Works
+
+### Rule Types
+
+| Rule Type | Example | What it Blocks |
+|-----------|---------|----------------|
+| IP | `192.168.1.50` | All traffic from this source |
+| App | `YouTube` | All YouTube connections |
+| Domain | `tiktok` | Any SNI containing "tiktok" |
+
+### The Blocking Flow
+
+```
+Packet arrives
+      │
+      ▼
+┌─────────────────────────────────┐
+│ Is source IP in blocked list?  │──Yes──► DROP
+└───────────────┬─────────────────┘
+                │No
+                ▼
+┌─────────────────────────────────┐
+│ Is app type in blocked list?   │──Yes──► DROP
+└───────────────┬─────────────────┘
+                │No
+                ▼
+┌─────────────────────────────────┐
+│ Does SNI match blocked domain? │──Yes──► DROP
+└───────────────┬─────────────────┘
+                │No
+                ▼
+            FORWARD
+```
+
+### Flow-Based Blocking
+
+**Important:** We block at the *flow* level, not packet level.
+
+```
+Connection to YouTube:
+  Packet 1 (SYN)           → No SNI yet, FORWARD
+  Packet 2 (SYN-ACK)       → No SNI yet, FORWARD  
+  Packet 3 (ACK)           → No SNI yet, FORWARD
+  Packet 4 (Client Hello)  → SNI: www.youtube.com
+                           → App: YOUTUBE (blocked!)
+                           → Mark flow as BLOCKED
+                           → DROP this packet
+  Packet 5 (Data)          → Flow is BLOCKED → DROP
+  Packet 6 (Data)          → Flow is BLOCKED → DROP
+  ...all subsequent packets → DROP
+```
+
+**Why this approach?**
+- We can't identify the app until we see the Client Hello
+- Once identified, we block all future packets of that flow
+- The connection will fail/timeout on the client
+
+---
+
+## 10. Building and Running
+
+### Prerequisites
+
+- **macOS/Linux** with C++17 compiler
+- **g++** or **clang++**
+- No external libraries needed!
+
+### Build Commands
+
+**Simple Version:**
+```bash
+g++ -std=c++17 -O2 -I include -o dpi_simple \
+    src/main_working.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+**Multi-threaded Version:**
+```bash
+g++ -std=c++17 -pthread -O2 -I include -o dpi_engine \
+    src/dpi_mt.cpp \
+    src/pcap_reader.cpp \
+    src/packet_parser.cpp \
+    src/sni_extractor.cpp \
+    src/types.cpp
+```
+
+### Running
+
+**Basic usage:**
+```bash
+./dpi_engine test_dpi.pcap output.pcap
+```
+
+**With blocking:**
+```bash
+./dpi_engine test_dpi.pcap output.pcap \
+    --block-app YouTube \
+    --block-app TikTok \
+    --block-ip 192.168.1.50 \
+    --block-domain facebook
+```
+
+**Configure threads (multi-threaded only):**
+```bash
+./dpi_engine input.pcap output.pcap --lbs 4 --fps 4
+# Creates 4 LB threads × 4 FP threads = 16 processing threads
+```
+
+### Creating Test Data
+
+```bash
+python3 generate_test_pcap.py
+# Creates test_dpi.pcap with sample traffic
+```
+
+---
+
+## 11. Understanding the Output
+
+### Sample Output
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║              DPI ENGINE v2.0 (Multi-threaded)                 ║
+╠══════════════════════════════════════════════════════════════╣
+║ Load Balancers:  2    FPs per LB:  2    Total FPs:  4        ║
+╚══════════════════════════════════════════════════════════════╝
+
+[Rules] Blocked app: YouTube
+[Rules] Blocked IP: 192.168.1.50
+
+[Reader] Processing packets...
+[Reader] Done reading 77 packets
+
+╔══════════════════════════════════════════════════════════════╗
+║                      PROCESSING REPORT                        ║
+╠══════════════════════════════════════════════════════════════╣
+║ Total Packets:                77                              ║
+║ Total Bytes:                5738                              ║
+║ TCP Packets:                  73                              ║
+║ UDP Packets:                   4                              ║
+╠══════════════════════════════════════════════════════════════╣
+║ Forwarded:                    69                              ║
+║ Dropped:                       8                              ║
+╠══════════════════════════════════════════════════════════════╣
+║ THREAD STATISTICS                                             ║
+║   LB0 dispatched:             53                              ║
+║   LB1 dispatched:             24                              ║
+║   FP0 processed:              53                              ║
+║   FP1 processed:               0                              ║
+║   FP2 processed:               0                              ║
+║   FP3 processed:              24                              ║
+╠══════════════════════════════════════════════════════════════╣
+║                   APPLICATION BREAKDOWN                       ║
+╠══════════════════════════════════════════════════════════════╣
+║ HTTPS                39  50.6% ##########                     ║
+║ Unknown              16  20.8% ####                           ║
+║ YouTube               4   5.2% # (BLOCKED)                    ║
+║ DNS                   4   5.2% #                              ║
+║ Facebook              3   3.9%                                ║
+║ ...                                                           ║
+╚══════════════════════════════════════════════════════════════╝
+
+[Detected Domains/SNIs]
+  - www.youtube.com -> YouTube
+  - www.facebook.com -> Facebook
+  - www.google.com -> Google
+  - github.com -> GitHub
+  ...
+```
+
+### What Each Section Means
+
+| Section | Meaning |
+|---------|---------|
+| Configuration | Number of threads created |
+| Rules | Which blocking rules are active |
+| Total Packets | Packets read from input file |
+| Forwarded | Packets written to output file |
+| Dropped | Packets blocked (not written) |
+| Thread Statistics | Work distribution across threads |
+| Application Breakdown | Traffic classification results |
+| Detected SNIs | Actual domain names found |
+
+---
+
+## 12. Extending the Project
+
+### Ideas for Improvement
+
+1. **Add More App Signatures**
+   ```cpp
+   // In types.cpp
+   if (sni.find("twitch") != std::string::npos)
+       return AppType::TWITCH;
+   ```
+
+2. **Add Bandwidth Throttling**
+   ```cpp
+   // Instead of DROP, delay packets
+   if (shouldThrottle(flow)) {
+       std::this_thread::sleep_for(10ms);
+   }
+   ```
+
+3. **Add Live Statistics Dashboard**
+   ```cpp
+   // Separate thread printing stats every second
+   void statsThread() {
+       while (running) {
+           printStats();
+           sleep(1);
+       }
+   }
+   ```
+
+4. **Add QUIC/HTTP3 Support**
+   - QUIC uses UDP on port 443
+   - SNI is in the Initial packet (encrypted differently)
+
+5. **Add Persistent Rules**
+   - Save rules to file
+   - Load on startup
+
+---
+
+## Summary
+
+This DPI engine demonstrates:
+
+1. **Network Protocol Parsing** - Understanding packet structure
+2. **Deep Packet Inspection** - Looking inside encrypted connections
+3. **Flow Tracking** - Managing stateful connections
+4. **Multi-threaded Architecture** - Scaling with thread pools
+5. **Producer-Consumer Pattern** - Thread-safe queues
+
+The key insight is that even HTTPS traffic leaks the destination domain in the TLS handshake, allowing network operators to identify and control application usage.
+
+---
+
